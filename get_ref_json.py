@@ -134,4 +134,4 @@ if __name__ == '__main__':
     app.run(main)
 
 ##### Usage
-#python your_script.py --input YourRootDirectory --output YourOutputFile.json
+#python get_ref_json.py --input YourRootDirectory --output YourOutputFile.json

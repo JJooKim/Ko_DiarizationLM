@@ -1,95 +1,437 @@
-import whisperx
 import os
+import wget
+from omegaconf import OmegaConf
 import json
-from tqdm import tqdm
-from utils_hyp import * 
+import shutil
+from faster_whisper import WhisperModel
+import whisperx
+import torch
+from pydub import AudioSegment
+from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+from deepmultilingualpunctuation import PunctuationModel
+import re
+import logging
+import nltk
+from whisperx.alignment import DEFAULT_ALIGN_MODELS_HF, DEFAULT_ALIGN_MODELS_TORCH
+from whisperx.utils import LANGUAGES, TO_LANGUAGE_CODE
 
+import unidecode
+from unidecode import unidecode
+import pathlib
+from pathlib import Path
 
-# ? Check purpose
-ROOT = os.getcwd()
-temp_path = os.path.join(ROOT, "temp_outputs")
-os.makedirs(temp_path, exist_ok=True)
-
-
-def get_hyp_json(audio_path, whisper_model, alignment_model, metadata,batch_size=8, language="ko", device="cuda"):
-    enable_stemming = False
-
-    rename_file(audio_path)
-
-    ## 1. Separating music from speech using Demucs
-    if enable_stemming:
-        # Isolate vocals from the rest of the audio
-
-        return_code = os.system(
-            f'python3 -m demucs.separate -n htdemucs --two-stems=vocals "{audio_path}" -o "temp_outputs"'
-        )
-
-        if return_code != 0:
-            logging.warning("Source splitting failed, using original audio file.")
-            vocal_target = audio_path
-        else:
-            vocal_target = os.path.join(
-                "temp_outputs",
-                "htdemucs",
-                os.path.splitext(os.path.basename(audio_path))[0],
-                "vocals.wav",
-            )
-    else:
-        vocal_target = audio_path
-
-    ## 2.Transcriping audio using Whisper and realligning timestamps using Wav2Vec2
-    whisper_results, language = transcribe_batched(
-        vocal_target,
-        language,
-        batch_size,
-        device,
-        whisper_model
-    )
-
-
-    ## 3.Aligning the transcription with the original audio using Wav2Vec2
-    result_aligned = whisperx.align(
-        whisper_results, alignment_model, metadata, vocal_target, device
-    )
-    word_timestamps = filter_missing_timestamps(result_aligned["word_segments"])
-
-    # clear gpu vram
-    #del alignment_model
-    torch.cuda.empty_cache()
-
-    # 4.
-    sound = AudioSegment.from_file(vocal_target).set_channels(1)
-    output_file_path = os.path.join(temp_path, "mono_file.wav")
-    sound.export(output_file_path, format="wav")
-    msdd_model = NeuralDiarizer(cfg=create_config(temp_path, DOMAIN_TYPE="telephonic")).to("cuda")
-    msdd_model.diarize()
-    os.remove(output_file_path)
-    del msdd_model
-    torch.cuda.empty_cache()
-
-
-    speaker_ts = []
-    with open(os.path.join(temp_path, "pred_rttms", "mono_file.rttm"), "r") as f:
-        lines = f.readlines()
-        for line in lines:
-            line_list = line.split(" ")
-            s = int(float(line_list[5]) * 1000)
-            e = s + int(float(line_list[8]) * 1000)
-            speaker_ts.append([s, e, int(line_list[11].split("_")[-1])])
-
-    wsm = get_words_speaker_mapping(word_timestamps, speaker_ts, "start")
-
-    wsm = get_realigned_ws_mapping_with_punctuation(wsm)
-    #ssm = get_sentences_speaker_mapping(wsm, speaker_ts)
-    return wsm
-
-
-
-import os
 import wave
 from moviepy.editor import concatenate_audioclips, AudioFileClip
+punct_model_langs = [
+    "en",
+    "fr",
+    "de",
+    "es",
+    "it",
+    "nl",
+    "pt",
+    "bg",
+    "pl",
+    "cs",
+    "sk",
+    "sl",
+]
+wav2vec2_langs = list(DEFAULT_ALIGN_MODELS_TORCH.keys()) + list(
+    DEFAULT_ALIGN_MODELS_HF.keys()
+)
 
-def concatenate_wav_files(directory_path, output_file, whisper_model, alignment_model, metadata):
+whisper_langs = sorted(LANGUAGES.keys()) + sorted(
+    [k.title() for k in TO_LANGUAGE_CODE.keys()]
+)
+
+
+def create_config(output_dir, DOMAIN_TYPE = "telephonic"):
+    # DOMAIN_TYPE: can be meeting, telephonic, or general based on domain type of the audio file
+    CONFIG_FILE_NAME = f"diar_infer_{DOMAIN_TYPE}.yaml"
+    CONFIG_URL = f"https://raw.githubusercontent.com/NVIDIA/NeMo/main/examples/speaker_tasks/diarization/conf/inference/{CONFIG_FILE_NAME}"
+    MODEL_CONFIG = os.path.join(output_dir, CONFIG_FILE_NAME)
+    if not os.path.exists(MODEL_CONFIG):
+        MODEL_CONFIG = wget.download(CONFIG_URL, output_dir)
+
+    config = OmegaConf.load(MODEL_CONFIG)
+
+    data_dir = os.path.join(output_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    meta = {
+        "audio_filepath": os.path.join(output_dir, "mono_file.wav"),
+        "offset": 0,
+        "duration": None,
+        "label": "infer",
+        "text": "-",
+        "rttm_filepath": None,
+        "uem_filepath": None,
+    }
+    with open(os.path.join(data_dir, "input_manifest.json"), "w") as fp:
+        json.dump(meta, fp)
+        fp.write("\n")
+
+    pretrained_vad = "vad_multilingual_marblenet"
+    pretrained_speaker_model = "titanet_large"
+    config.num_workers = 0  # Workaround for multiprocessing hanging with ipython issue
+    config.diarizer.manifest_filepath = os.path.join(data_dir, "input_manifest.json")
+    config.diarizer.out_dir = (
+        output_dir  # Directory to store intermediate files and prediction outputs
+    )
+
+    config.diarizer.speaker_embeddings.model_path = pretrained_speaker_model
+    config.diarizer.oracle_vad = (
+        False  # compute VAD provided with model_path to vad config
+    )
+    config.diarizer.clustering.parameters.oracle_num_speakers = False
+
+    # Here, we use our in-house pretrained NeMo VAD model
+    config.diarizer.vad.model_path = pretrained_vad
+    config.diarizer.vad.parameters.onset = 0.8
+    config.diarizer.vad.parameters.offset = 0.6
+    config.diarizer.vad.parameters.pad_offset = -0.05
+    config.diarizer.msdd_model.model_path = (
+        "diar_msdd_telephonic"  # Telephonic speaker diarization model
+    )
+
+    return config
+
+
+def get_word_ts_anchor(s, e, option="start"):
+    if option == "end":
+        return e
+    elif option == "mid":
+        return (s + e) / 2
+    return s
+
+
+def get_words_speaker_mapping(wrd_ts, spk_ts, word_anchor_option="start"):
+    s, e, sp = spk_ts[0]
+    wrd_pos, turn_idx = 0, 0
+    wrd_spk_mapping = []
+    for wrd_dict in wrd_ts:
+        ws, we, wrd = (
+            int(wrd_dict["start"] * 1000),
+            int(wrd_dict["end"] * 1000),
+            wrd_dict["word"],
+        )
+        wrd_pos = get_word_ts_anchor(ws, we, word_anchor_option)
+        while wrd_pos > float(e):
+            turn_idx += 1
+            turn_idx = min(turn_idx, len(spk_ts) - 1)
+            s, e, sp = spk_ts[turn_idx]
+            if turn_idx == len(spk_ts) - 1:
+                e = get_word_ts_anchor(ws, we, option="end")
+        wrd_spk_mapping.append(
+            {"word": wrd, "start_time": ws, "end_time": we, "speaker": sp}
+        )
+    return wrd_spk_mapping
+
+
+sentence_ending_punctuations = ".?!"
+
+
+def get_first_word_idx_of_sentence(word_idx, word_list, speaker_list, max_words):
+    is_word_sentence_end = (
+        lambda x: x >= 0 and word_list[x][-1] in sentence_ending_punctuations
+    )
+    left_idx = word_idx
+    while (
+        left_idx > 0
+        and word_idx - left_idx < max_words
+        and speaker_list[left_idx - 1] == speaker_list[left_idx]
+        and not is_word_sentence_end(left_idx - 1)
+    ):
+        left_idx -= 1
+
+    return left_idx if left_idx == 0 or is_word_sentence_end(left_idx - 1) else -1
+
+
+def get_last_word_idx_of_sentence(word_idx, word_list, max_words):
+    is_word_sentence_end = (
+        lambda x: x >= 0 and word_list[x][-1] in sentence_ending_punctuations
+    )
+    right_idx = word_idx
+    while (
+        right_idx < len(word_list)
+        and right_idx - word_idx < max_words
+        and not is_word_sentence_end(right_idx)
+    ):
+        right_idx += 1
+
+    return (
+        right_idx
+        if right_idx == len(word_list) - 1 or is_word_sentence_end(right_idx)
+        else -1
+    )
+
+
+def get_realigned_ws_mapping_with_punctuation(
+    word_speaker_mapping, max_words_in_sentence=50
+):
+    is_word_sentence_end = (
+        lambda x: x >= 0
+        and word_speaker_mapping[x]["word"][-1] in sentence_ending_punctuations
+    )
+    wsp_len = len(word_speaker_mapping)
+
+    words_list, speaker_list = [], []
+    for k, line_dict in enumerate(word_speaker_mapping):
+        word, speaker = line_dict["word"], line_dict["speaker"]
+        words_list.append(word)
+        speaker_list.append(speaker)
+
+    k = 0
+    while k < len(word_speaker_mapping):
+        line_dict = word_speaker_mapping[k]
+        if (
+            k < wsp_len - 1
+            and speaker_list[k] != speaker_list[k + 1]
+            and not is_word_sentence_end(k)
+        ):
+            left_idx = get_first_word_idx_of_sentence(
+                k, words_list, speaker_list, max_words_in_sentence
+            )
+            right_idx = (
+                get_last_word_idx_of_sentence(
+                    k, words_list, max_words_in_sentence - k + left_idx - 1
+                )
+                if left_idx > -1
+                else -1
+            )
+            if min(left_idx, right_idx) == -1:
+                k += 1
+                continue
+
+            spk_labels = speaker_list[left_idx : right_idx + 1]
+            mod_speaker = max(set(spk_labels), key=spk_labels.count)
+            if spk_labels.count(mod_speaker) < len(spk_labels) // 2:
+                k += 1
+                continue
+
+            speaker_list[left_idx : right_idx + 1] = [mod_speaker] * (
+                right_idx - left_idx + 1
+            )
+            k = right_idx
+
+        k += 1
+
+    k, realigned_list = 0, []
+    while k < len(word_speaker_mapping):
+        line_dict = word_speaker_mapping[k].copy()
+        line_dict["speaker"] = speaker_list[k]
+        realigned_list.append(line_dict)
+        k += 1
+
+    return realigned_list
+
+
+def get_sentences_speaker_mapping(word_speaker_mapping, spk_ts):
+    sentence_checker = nltk.tokenize.PunktSentenceTokenizer().text_contains_sentbreak
+    s, e, spk = spk_ts[0]
+    prev_spk = spk
+
+    snts = []
+    snt = {"speaker": f"Speaker {spk}", "start_time": s, "end_time": e, "text": ""}
+
+    for wrd_dict in word_speaker_mapping:
+        wrd, spk = wrd_dict["word"], wrd_dict["speaker"]
+        s, e = wrd_dict["start_time"], wrd_dict["end_time"]
+        if spk != prev_spk or sentence_checker(snt["text"] + " " + wrd):
+            snts.append(snt)
+            snt = {
+                "speaker": f"Speaker {spk}",
+                "start_time": s,
+                "end_time": e,
+                "text": "",
+            }
+        else:
+            snt["end_time"] = e
+        snt["text"] += wrd + " "
+        prev_spk = spk
+
+    snts.append(snt)
+    return snts
+
+
+def get_speaker_aware_transcript(sentences_speaker_mapping, f):
+    previous_speaker = sentences_speaker_mapping[0]["speaker"]
+    f.write(f"{previous_speaker}: ")
+
+    for sentence_dict in sentences_speaker_mapping:
+        speaker = sentence_dict["speaker"]
+        sentence = sentence_dict["text"]
+
+        # If this speaker doesn't match the previous one, start a new paragraph
+        if speaker != previous_speaker:
+            f.write(f"\n\n{speaker}: ")
+            previous_speaker = speaker
+
+        # No matter what, write the current sentence
+        f.write(sentence + " ")
+
+
+def format_timestamp(
+    milliseconds: float, always_include_hours: bool = False, decimal_marker: str = "."
+):
+    assert milliseconds >= 0, "non-negative timestamp expected"
+
+    hours = milliseconds // 3_600_000
+    milliseconds -= hours * 3_600_000
+
+    minutes = milliseconds // 60_000
+    milliseconds -= minutes * 60_000
+
+    seconds = milliseconds // 1_000
+    milliseconds -= seconds * 1_000
+
+    hours_marker = f"{hours:02d}:" if always_include_hours or hours > 0 else ""
+    return (
+        f"{hours_marker}{minutes:02d}:{seconds:02d}{decimal_marker}{milliseconds:03d}"
+    )
+
+
+def write_srt(transcript, file):
+    """
+    Write a transcript to a file in SRT format.
+
+    """
+    for i, segment in enumerate(transcript, start=1):
+        # write srt lines
+        print(
+            f"{i}\n"
+            f"{format_timestamp(segment['start_time'], always_include_hours=True, decimal_marker=',')} --> "
+            f"{format_timestamp(segment['end_time'], always_include_hours=True, decimal_marker=',')}\n"
+            f"{segment['speaker']}: {segment['text'].strip().replace('-->', '->')}\n",
+            file=file,
+            flush=True,
+        )
+
+
+def find_numeral_symbol_tokens(tokenizer):
+    numeral_symbol_tokens = [
+        -1,
+    ]
+    for token, token_id in tokenizer.get_vocab().items():
+        has_numeral_symbol = any(c in "0123456789%$£" for c in token)
+        if has_numeral_symbol:
+            numeral_symbol_tokens.append(token_id)
+    return numeral_symbol_tokens
+
+
+def _get_next_start_timestamp(word_timestamps, current_word_index):
+    # if current word is the last word
+    if current_word_index == len(word_timestamps) - 1:
+        return word_timestamps[current_word_index]["start"]
+
+    next_word_index = current_word_index + 1
+    while current_word_index < len(word_timestamps) - 1:
+        if word_timestamps[next_word_index].get("start") is None:
+            # if next word doesn't have a start timestamp
+            # merge it with the current word and delete it
+            word_timestamps[current_word_index]["word"] += (
+                " " + word_timestamps[next_word_index]["word"]
+            )
+
+            word_timestamps[next_word_index]["word"] = None
+            next_word_index += 1
+
+        else:
+            return word_timestamps[next_word_index]["start"]
+
+
+def filter_missing_timestamps(word_timestamps):
+    # handle the first and last word
+    if word_timestamps[0].get("start") is None:
+        word_timestamps[0]["start"] = 0
+        word_timestamps[0]["end"] = _get_next_start_timestamp(word_timestamps, 0)
+
+    result = [
+        word_timestamps[0],
+    ]
+
+    for i, ws in enumerate(word_timestamps[1:], start=1):
+        # if ws doesn't have a start and end
+        # use the previous end as start and next start as end
+        if ws.get("start") is None and ws.get("word") is not None:
+            ws["start"] = word_timestamps[i - 1]["end"]
+            ws["end"] = _get_next_start_timestamp(word_timestamps, i)
+
+        if ws["word"] is not None:
+            result.append(ws)
+    return result
+
+
+def cleanup(path: str):
+    """path could either be relative or absolute."""
+    # check if file or directory exists
+    if os.path.isfile(path) or os.path.islink(path):
+        # remove file
+        os.remove(path)
+    elif os.path.isdir(path):
+        # remove directory and all its content
+        shutil.rmtree(path)
+    else:
+        raise ValueError("Path {} is not a file or dir.".format(path))
+
+
+def process_language_arg(language: str, model_name: str):
+    """
+    Process the language argument to make sure it's valid and convert language names to language codes.
+    """
+    if language is not None:
+        language = language.lower()
+    if language not in LANGUAGES:
+        if language in TO_LANGUAGE_CODE:
+            language = TO_LANGUAGE_CODE[language]
+        else:
+            raise ValueError(f"Unsupported language: {language}")
+
+    if model_name.endswith(".en") and language != "en":
+        if language is not None:
+            logging.warning(
+                f"{model_name} is an English-only model but received '{language}'; using English instead."
+            )
+        language = "en"
+    return language
+
+# no space, punctuation, accent in lower string
+def cleanString(string):
+    cleanString = unidecode(string)
+    # cleanString = re.sub('\W+','_', cleanString)
+    cleanString = re.sub(r'[^\w\s]','',cleanString)
+    cleanString = cleanString.replace(" ", "_")
+    return cleanString.lower()
+
+# rename audio filename to get name without accent, no space, in lower case
+def rename_file(filepath):
+    suffix = Path(filepath).suffix
+    if str(Path(filepath).parent) != ".":
+        new_filepath = str(Path(filepath).parent) + cleanString(filepath.replace(suffix, "")) + suffix
+    else:
+        new_filepath = cleanString(filepath.replace(suffix, "")) + suffix
+    os.rename(filepath, new_filepath)
+    return new_filepath
+
+
+
+
+
+def transcribe_batched(
+    audio_file: str,
+    language: str,
+    batch_size: int,
+    device: str,
+    whisper_model,
+
+):
+    audio = whisperx.load_audio(audio_file)
+    result = whisper_model.transcribe(audio, language=language, batch_size=batch_size)
+    #del whisper_model
+    torch.cuda.empty_cache()
+    return result["segments"], result["language"]
+
+def concatenate_wav_files(directory_path, output_file):
     wav_files = [f for f in os.listdir(directory_path) if f.endswith('.wav')]
     if 'full.wav' in wav_files:
         wav_files.remove('full.wav')
@@ -97,63 +439,6 @@ def concatenate_wav_files(directory_path, output_file, whisper_model, alignment_
     clips = [AudioFileClip(os.path.join(directory_path, wav_file)) for wav_file in wav_files]
     final_clip = concatenate_audioclips(clips)
     final_clip.write_audiofile(output_file)
-    wsm = get_hyp_json(output_file, whisper_model, alignment_model, metadata)
+    wsm = get_hyp_json(output_file)
     os.remove(output_file)
     return wsm
-
-
-
-
-
-def add_hyp_values(input = 'data.json'):
-
-    with open(input, 'r', encoding='utf-8-sig') as file:
-        json_data = json.load(file)
-
-    # whisper model
-    whisper_model = whisperx.load_model(
-        "large-v3",
-        device="cuda",
-        compute_type="float16",
-        asr_options={"suppress_numerals": True},
-        language="ko"
-    )
-
-    # allignment_model
-    alignment_model, metadata = whisperx.load_align_model(
-    language_code="ko", device="cuda"
-    )
-
-
-    utterances = json_data['utterances']
-    i = 0
-    for utterance in utterances: # 너무 길면 잘라서
-        print(i)
-        i += 1
-        dir_path = utterance["utterance_id"] # eg. "Data/Training/D60/J91/S00009134" so the wav and txt file were together
-        output_file = 'full.wav'
-        wsm = concatenate_wav_files(dir_path, output_file, whisper_model, alignment_model, metadata)
-        # hyp_texts = [re.sub(r'[^가-힣]', '', entry['word']) for entry in wsm]
-        # hyp_spks = [str(int(entry['speaker']) + 1) for entry in wsm]
-        hyp_texts = []
-        hyp_spks = []
-        for entry in wsm:
-            txt = re.sub(r'[^가-힣]', '', entry['word'])
-            if txt == '':
-                continue
-            else:
-                hyp_texts.append(txt)
-                hyp_spks.append(str(int(entry['speaker']) + 1))
-                
-
-        utterance['hyp_text'] = ' '.join(hyp_texts)
-        utterance['hyp_spk'] = ' '.join(hyp_spks)
-        if (i % 50) == 0:
-            with open(input, 'w', encoding='utf-8-sig') as file:
-                json.dump(json_data, file, indent=2)
-        
-    with open(input, 'w', encoding='utf-8-sig') as file:
-        json.dump(json_data, file, indent=2)
-
-
-add_hyp_values('data.json')

@@ -107,9 +107,10 @@ def get_ref_json(input='Data/Training/D60/J91', output = 'data.json'):
         4: 0
     }
     for root, dirs, files in os.walk(input):
+        if dirs == []: break
         for directory in dirs:
             s_json = get_ref_data(os.path.join(root, directory)) # json data for 1 conversation
-
+            
             if s_json in [1, 2, 3, 4]:
                 error_case[s_json] += 1
                 continue
@@ -124,8 +125,8 @@ def get_ref_json(input='Data/Training/D60/J91', output = 'data.json'):
 
 def main(argv):
     del argv  # Unused
-    input = FLAGS.root_directory
-    output = FLAGS.json_file
+    input = FLAGS.input
+    output = FLAGS.output
     error_case = get_ref_json(input, output)
     print("Error cases:", error_case)
 

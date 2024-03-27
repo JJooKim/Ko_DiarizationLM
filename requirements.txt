@@ -1,6 +1,9 @@
 wget
-nemo_toolkit[asr]==1.22.0
-git+https://github.com/m-bain/whisperX.git@78dcfaab51005aa703ee21375f81ed31bc248560
-git+https://github.com/facebookresearch/demucs#egg=demucs
-deepmultilingualpunctuation
+!pip install git+https://github.com/m-bain/whisperx.git
+!pip install --no-build-isolation nemo_toolkit[asr]==1.21.0
+!pip install git+https://github.com/facebookresearch/demucs#egg=demucs
+!pip install deepmultilingualpunctuation
+!pip install wget pydub
+!pip install numba==0.58.0
+!pip install unidecode
 tqdm

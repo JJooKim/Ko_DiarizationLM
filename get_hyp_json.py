@@ -3,19 +3,7 @@ import os
 import json
 from tqdm import tqdm
 from utils_hyp import * 
-# whisper model whats
-whisper_model = whisperx.load_model(
-    "large-v3",
-    device="cuda",
-    compute_type="float16",
-    asr_options={"suppress_numerals": True},
-    language="ko"
-)
 
-# allignment_model
-alignment_model, metadata = whisperx.load_align_model(
-language_code="ko", device="cuda"
-)
 
 # ? Check purpose
 ROOT = os.getcwd()
@@ -23,7 +11,7 @@ temp_path = os.path.join(ROOT, "temp_outputs")
 os.makedirs(temp_path, exist_ok=True)
 
 
-def get_hyp_json(audio_path, batch_size=8, language="ko", device="cuda"):
+def get_hyp_json(audio_path, whisper_model, alignment_model, metadata,batch_size=8, language="ko", device="cuda"):
     enable_stemming = False
 
     rename_file(audio_path)
@@ -54,7 +42,8 @@ def get_hyp_json(audio_path, batch_size=8, language="ko", device="cuda"):
         vocal_target,
         language,
         batch_size,
-        device
+        device,
+        whisper_model
     )
 
 
@@ -100,7 +89,7 @@ import os
 import wave
 from moviepy.editor import concatenate_audioclips, AudioFileClip
 
-def concatenate_wav_files(directory_path, output_file):
+def concatenate_wav_files(directory_path, output_file, whisper_model, alignment_model, metadata):
     wav_files = [f for f in os.listdir(directory_path) if f.endswith('.wav')]
     if 'full.wav' in wav_files:
         wav_files.remove('full.wav')
@@ -108,18 +97,34 @@ def concatenate_wav_files(directory_path, output_file):
     clips = [AudioFileClip(os.path.join(directory_path, wav_file)) for wav_file in wav_files]
     final_clip = concatenate_audioclips(clips)
     final_clip.write_audiofile(output_file)
-    wsm = get_hyp_json(output_file)
+    wsm = get_hyp_json(output_file, whisper_model, alignment_model, metadata)
     os.remove(output_file)
     return wsm
 
 
 
-with open('data.json', 'r', encoding='utf-8-sig') as file:
-    json_data = json.load(file)
 
 
+def add_hyp_values(input = 'data.json'):
 
-def add_hyp_values(json_data):
+    with open(input, 'r', encoding='utf-8-sig') as file:
+        json_data = json.load(file)
+
+    # whisper model
+    whisper_model = whisperx.load_model(
+        "large-v3",
+        device="cuda",
+        compute_type="float16",
+        asr_options={"suppress_numerals": True},
+        language="ko"
+    )
+
+    # allignment_model
+    alignment_model, metadata = whisperx.load_align_model(
+    language_code="ko", device="cuda"
+    )
+
+
     utterances = json_data['utterances']
     i = 0
     for utterance in utterances: # 너무 길면 잘라서
@@ -127,7 +132,7 @@ def add_hyp_values(json_data):
         i += 1
         dir_path = utterance["utterance_id"] # eg. "Data/Training/D60/J91/S00009134" so the wav and txt file were together
         output_file = 'full.wav'
-        wsm = concatenate_wav_files(dir_path, output_file)
+        wsm = concatenate_wav_files(dir_path, output_file, whisper_model, alignment_model, metadata)
         # hyp_texts = [re.sub(r'[^가-힣]', '', entry['word']) for entry in wsm]
         # hyp_spks = [str(int(entry['speaker']) + 1) for entry in wsm]
         hyp_texts = []
@@ -144,9 +149,9 @@ def add_hyp_values(json_data):
         utterance['hyp_text'] = ' '.join(hyp_texts)
         utterance['hyp_spk'] = ' '.join(hyp_spks)
         if (i % 50) == 0:
-            with open('data.json', 'w', encoding='utf-8-sig') as file:
+            with open(input, 'w', encoding='utf-8-sig') as file:
                 json.dump(json_data, file, indent=2)
-        break
-    with open('data.json', 'w', encoding='utf-8-sig') as file:
+        
+    with open(input, 'w', encoding='utf-8-sig') as file:
         json.dump(json_data, file, indent=2)
-add_hyp_values(json_data)
+add_hyp_values('data.json')

@@ -3,7 +3,7 @@ import os
 import json
 from tqdm import tqdm
 from utils_hyp import * 
-# whisper model
+# whisper model whats
 whisper_model = whisperx.load_model(
     "large-v3",
     device="cuda",

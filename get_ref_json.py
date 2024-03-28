@@ -1,8 +1,6 @@
 import json
 import os
 import re
-
-
 from absl import app
 from absl import flags
 
@@ -17,7 +15,7 @@ def get_ref_text(input_text):
     processed_text = re.sub(r'\([^)]+\)/\(([^)]+)\)', r'\1', input_text)
 
     # Remove non-Korean characters
-    processed_text = re.sub(r'[^가-힣\s]', '', processed_text)
+    processed_text = re.sub(r'[^가-힣\s]', ' ', processed_text)
 
     # Removing extra whitespaces and trimming
     processed_text = re.sub(r'\s+', ' ', processed_text).strip()

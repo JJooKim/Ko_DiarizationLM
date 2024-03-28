@@ -5,9 +5,6 @@ import re
 
 from absl import app
 from absl import flags
-import utils
-
-
 
 FLAGS = flags.FLAGS
 

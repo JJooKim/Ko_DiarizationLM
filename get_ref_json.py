@@ -72,6 +72,9 @@ def get_ref_data(directory_path): # eg.directory_path = Data/Training/D60/J91/S1
             return 3 # Conversation Drop Case 3 (존재 해야 할 파일이 존재하지 않는 경우)
         
         text = get_ref_text(text)
+        if text == "": 
+            print(f"5. No text or audio in utterance: {text_path}")
+            return 5 # Conversation Drop Case 5
         ref_texts.append(text)
         ref_spks.extend([str(spk_ids.index(dialog["speaker"]) + 1)] * len(text.split()))
 
@@ -99,7 +102,8 @@ def get_ref_json(input='Data/Training/D60/J91', output = 'data.json'):
         1: 0,
         2: 0,
         3: 0,
-        4: 0
+        4: 0,
+        5: 0
     }
     for root, dirs, files in os.walk(input):
         if dirs == []: break

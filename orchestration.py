@@ -9,10 +9,6 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('input', 'data.json', 'Root directory containing conversation data')
 
-# def drop_spk_3(data):
-#     for utter in data:
-#         if '3' in utter['hyp_spk']: 
-#             data.remove(utter)
 
 def get_oracle_hyp_spk(data):
     for utter in tqdm(data):
@@ -25,18 +21,19 @@ def get_diarized_text(data):
         utter["ref_diarized_text"] = create_diarized_text(utter['ref_text'].split(), utter['ref_spk'].split())
         utter["hyp_diarized_text"] = create_diarized_text(utter['hyp_text'].split(), utter['hyp_spk'].split())
         utter["hyp_diarized_text_oracle"] = create_diarized_text(utter['hyp_text'].split(), utter['hyp_spk_oracle'].split())
+def get_diarized_text_llm(data):
+    for utter in tqdm(data):
+        utter["1_epoch_diarized_text"] = create_diarized_text(utter['hyp_text'].split(), utter['1_epoch_spk_completion'].split())
         
-
 def orchestration(input='data.json'):
 
     with open(input, 'r', encoding='utf-8-sig') as file:
         json_data = json.load(file)
     data = json_data['utterances']
 
-    #drop_spk_3(data)
-    get_oracle_hyp_spk(data)
-    get_diarized_text(data)
-
+    #get_oracle_hyp_spk(data)
+    #get_diarized_text(data)
+    get_diarized_text_llm(data)
 
     json_data['utterances'] = data # 없어도 될 듯
     with open(input, 'w', encoding='utf-8-sig') as file:

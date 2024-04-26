@@ -88,15 +88,18 @@ import os
 import wave
 from moviepy.editor import concatenate_audioclips, AudioFileClip
 
-def concatenate_wav_files(directory_path, output_file):
-    wav_files = [f for f in os.listdir(directory_path) if f.endswith('.wav')]
-    if 'full.wav' in wav_files:
-        wav_files.remove('full.wav')
-    wav_files.sort()  # Sort files in ascending order
-    clips = [AudioFileClip(os.path.join(directory_path, wav_file)) for wav_file in wav_files]
+def concatenate_wav_files(wave_path, output_file, whisper_model, alignment_model, metadata):
+
+    wave_files = [f"{wave_path.replace('_d_', '_q_')}.wav", f"{wave_path.replace('_d_', '_a_')}.wav"]
+
+
+    # if 'full.wav' in wave_files:
+    #     wave_files.remove('full.wav')
+    # # wav_files.sort()  # Sort files in ascending order
+    clips = [AudioFileClip('./'+wav_file) for wav_file in wave_files]
     final_clip = concatenate_audioclips(clips)
     final_clip.write_audiofile(output_file)
-    wsm = get_hyp_json(output_file)
+    wsm = get_hyp_json(output_file, whisper_model, alignment_model, metadata)
     os.remove(output_file)
     return wsm
 
